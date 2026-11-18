@@ -152,6 +152,7 @@ jobs:
         working-directory: Applesauce
         run: |
           python3 "$GITHUB_WORKSPACE/fix/patches/microphone.py"
+          python3 "$GITHUB_WORKSPACE/fix/patches/diagnostics.py"
           git diff --stat
 
       - name: Build shared SDL2
