@@ -49,6 +49,11 @@ jobs:
           submodules: recursive
           path: Applesauce
 
+      - name: Check out this repository (patches)
+        uses: actions/checkout@v4
+        with:
+          path: fix
+
       - name: Check out the touchHLE core
         if: ${{ inputs.with_touchhle_core }}
         uses: actions/checkout@v4
@@ -142,6 +147,12 @@ jobs:
           print("oaknut patched")
           PY
           git -C vendor/dynarmic diff
+
+      - name: Patch microphone input (HyperHLE core + iOS host)
+        working-directory: Applesauce
+        run: |
+          python3 "$GITHUB_WORKSPACE/fix/patches/microphone.py"
+          git diff --stat
 
       - name: Build shared SDL2
         working-directory: Applesauce
