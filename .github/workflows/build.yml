@@ -1,0 +1,158 @@
+name: Build Applesauce (JIT fix)
+
+# Builds Applesauce (https://github.com/johnny901901901/Applesauce, MPL-2.0)
+# with one fix to the HyperHLE core's JIT allocator, and packages the
+# TrollStore permanent-JIT IPA (A11 and older).
+#
+# The bug: dynarmic's iOS code allocator (oaknut CodeBlock) always asks for its
+# executable memory with `brk #0xf00d`, a trap only an attached JIT debugger
+# (StikDebug and friends) can service. When JIT comes from TrollStore's
+# dynamic-codesigning entitlement or a jailbreak, CS_DEBUGGED is set but no
+# debugger is attached, so the trap kills the app with SIGTRAP the moment any
+# game starts (crash in oaknut::detail::prepare_jit_region).
+#
+# The fix: only use the trap when a tracer is really attached (P_TRACED).
+# Otherwise map the region locally with mmap; the existing vm_remap code then
+# makes the writable alias exactly as before.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Applesauce tag or branch to build
+        type: string
+        default: ios-v0.4.1
+      with_touchhle_core:
+        description: Also build and embed the touchHLE core
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 150
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Select latest Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Check out Applesauce (HyperHLE + host app)
+        uses: actions/checkout@v4
+        with:
+          repository: johnny901901901/Applesauce
+          ref: ${{ inputs.upstream_ref }}
+          submodules: recursive
+          path: Applesauce
+
+      - name: Check out the touchHLE core
+        if: ${{ inputs.with_touchhle_core }}
+        uses: actions/checkout@v4
+        with:
+          repository: johnny901901901/Applesauce
+          ref: ios-core-dylib
+          submodules: recursive
+          path: touchHLE-core
+
+      - name: Install tools
+        run: |
+          brew install cmake ninja boost ldid || true
+          rustup update stable
+          rustup default stable
+          rustup target add aarch64-apple-ios
+          xcodebuild -version
+          cargo --version
+
+      - name: Patch oaknut JIT allocator
+        working-directory: Applesauce
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys
+
+          path = pathlib.Path("vendor/dynarmic/externals/oaknut/include/oaknut/code_block.hpp")
+          src = path.read_text()
+
+          def sub(old, new):
+              global src
+              if src.count(old) != 1:
+                  sys.exit(f"patch anchor not found exactly once: {old!r}")
+              src = src.replace(old, new)
+
+          # 1. sysctl for the P_TRACED check.
+          sub("#    include <sys/mman.h>\n#    include <unistd.h>\n#else",
+              "#    include <sys/mman.h>\n#    include <sys/sysctl.h>\n#    include <unistd.h>\n#else")
+
+          # 2. Helpers: is a JIT server attached, and a local fallback mapping.
+          sub("__attribute__((noinline, optnone, naked)) static void* prepare_jit_region(void*, std::size_t)",
+              """// Only an attached tracer (StikDebug, a debugger) can service the
+          // `brk #0xf00d` requests below. JIT granted by dynamic-codesigning
+          // (TrollStore permanent JIT) or by a jailbreak sets CS_DEBUGGED without
+          // any tracer, and there the trap would kill the process with SIGTRAP.
+          inline bool jit_server_attached()
+          {
+              struct kinfo_proc info {};
+              std::size_t length = sizeof(info);
+              int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+              if (sysctl(mib, 4, &info, &length, nullptr, 0) != 0)
+                  return true;  // Unknown: keep the original behaviour.
+              return (info.kp_proc.p_flag & P_TRACED) != 0;
+          }
+
+          inline void* map_local_jit_region(std::size_t size)
+          {
+              void* memory = mmap(nullptr, size, PROT_READ | PROT_EXEC, MAP_ANON | MAP_PRIVATE | MAP_JIT, -1, 0);
+              if (memory == MAP_FAILED)
+                  memory = mmap(nullptr, size, PROT_READ | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
+              return memory == MAP_FAILED ? nullptr : memory;
+          }
+
+          __attribute__((noinline, optnone, naked)) static void* prepare_jit_region(void*, std::size_t)""")
+
+          # 3. Use the trap only when a JIT server is attached.
+          sub("m_memory = (std::uint32_t*)detail::prepare_jit_region(nullptr, size);",
+              "const bool via_jit_server = detail::jit_server_attached();\n"
+              "            m_memory = via_jit_server\n"
+              "                ? (std::uint32_t*)detail::prepare_jit_region(nullptr, size)\n"
+              "                : (std::uint32_t*)detail::map_local_jit_region(size);")
+
+          # 4. Never send the detach trap if no server handed us the region.
+          sub("m_should_detach_jit_server = true;",
+              "m_should_detach_jit_server = via_jit_server;")
+
+          path.write_text(src)
+          print("oaknut patched")
+          PY
+          git -C vendor/dynarmic diff
+
+      - name: Build shared SDL2
+        working-directory: Applesauce
+        run: |
+          export TOUCHHLE_BOOST_ROOT="$(brew --prefix boost)/include"
+          export DEVELOPER_DIR="$(xcode-select -p)"
+          sh platform/ios/scripts/build-sdl-shared.sh iphoneos
+
+      - name: Build cores and app
+        working-directory: Applesauce
+        run: |
+          export TOUCHHLE_BOOST_ROOT="$(brew --prefix boost)/include"
+          export DEVELOPER_DIR="$(xcode-select -p)"
+          if [ "${{ inputs.with_touchhle_core }}" = "true" ]; then
+            export TOUCHHLE_CORE_REPO="$GITHUB_WORKSPACE/touchHLE-core"
+          fi
+          sh platform/ios/scripts/build-host.sh iphoneos Release
+
+      - name: Package IPAs
+        working-directory: Applesauce
+        run: |
+          sh platform/ios/scripts/package-ipa.sh --trollstore-permanent-jit
+          sh platform/ios/scripts/package-ipa.sh --trollstore
+          ls -la dist
+
+      - name: Upload IPAs
+        uses: actions/upload-artifact@v4
+        with:
+          name: Applesauce-jit-fix
+          path: Applesauce/dist/*.ipa
+          if-no-files-found: error
