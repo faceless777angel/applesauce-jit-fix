@@ -1,0 +1,53 @@
+name: Publish build as release
+
+# Takes the IPAs from a finished "Build Applesauce (JIT fix)" run and publishes
+# them as a GitHub release, so they can be downloaded straight on the iPhone.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: ID of the successful build run
+        type: string
+        required: true
+      tag:
+        description: Release tag
+        type: string
+        default: v0.4.1-jitfix.1
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download IPAs from the build run
+        uses: actions/download-artifact@v4
+        with:
+          name: Applesauce-jit-fix
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ls -la dist
+          (cd dist && shasum -a 256 *.ipa > SHA256SUMS.txt)
+          cat > notes.md <<'EOF'
+          Applesauce 0.4.1 (https://github.com/johnny901901901/Applesauce, MPL-2.0) built unchanged except for one fix in the HyperHLE core's JIT allocator.
+
+          **Fix:** dynarmic/oaknut asked for executable memory with `brk #0xf00d`, which only an attached JIT debugger (StikDebug) can service. With JIT from TrollStore permanent JIT or a jailbreak there is no debugger, so every game crashed at launch with SIGTRAP in `oaknut::detail::prepare_jit_region`. Now the trap is used only when a tracer is attached; otherwise the region is mapped locally with mmap.
+
+          - `Applesauce-iOS-trollstore-permanent-jit.ipa`: TrollStore / TrollStore Lite, A11 and older (iPhone X and earlier).
+          - `Applesauce-iOS-trollstore.ipa`: TrollStore, any chip, JIT enabled per launch.
+
+          Unofficial build, not affiliated with the Applesauce authors. No games included.
+          EOF
+          gh release create "${{ inputs.tag }}" dist/*.ipa dist/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Applesauce 0.4.1 + JIT fix" \
+            --notes-file notes.md
