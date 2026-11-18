@@ -578,6 +578,29 @@ patch("src/frameworks/audio_toolbox/audio_queue.rs", [
         "    _in_immediate: bool,\n) -> OSStatus {\n    return_if_null!(in_aq);\n"
         "    mic_close(env, in_aq);\n",
     ),
+    # kAudioQueueProperty_StreamDescription ('aqft') was advertised by
+    # property_size() but never answered, so AudioQueueGetProperty returned
+    # kAudioQueueErr_InvalidProperty. Talking John wraps that call in
+    # XThrowIfError and aborts with an uncaught CAXException.
+    (
+        "        kAudioQueueProperty_HardwareCodecPolicy => {\n"
+        "            env.mem.write(\n"
+        "                out_property_data.cast::<u32>(),\n",
+        "        kAudioQueueProperty_StreamDescription => {\n"
+        "            let format = host_object.format;\n"
+        "            env.mem.write(\n"
+        "                out_property_data.cast::<AudioStreamBasicDescription>(),\n"
+        "                format,\n"
+        "            );\n"
+        "            env.mem.write(\n"
+        "                io_data_size,\n"
+        "                guest_size_of::<AudioStreamBasicDescription>(),\n"
+        "            );\n"
+        "        }\n"
+        "        kAudioQueueProperty_HardwareCodecPolicy => {\n"
+        "            env.mem.write(\n"
+        "                out_property_data.cast::<u32>(),\n",
+    ),
     # Level metering on input queues.
     (
         "    out_data_size: MutPtr<u32>,\n) -> OSStatus {\n    return_if_null!(in_aq);\n\n    match property_size(in_property_id) {",
