@@ -12,8 +12,10 @@ name: Build Applesauce (JIT fix)
 # game starts (crash in oaknut::detail::prepare_jit_region).
 #
 # The fix: only use the trap when a tracer is really attached (P_TRACED).
-# Otherwise map the region locally with mmap; the existing vm_remap code then
-# makes the writable alias exactly as before.
+# Otherwise do what upstream touchHLE's oaknut does on iOS (and what works on
+# these devices): one anonymous RX mapping, flipped between RW and RX with
+# mprotect in protect()/unprotect(). A writable vm_remap alias is refused there
+# (first attempt ended in std::bad_alloc), so no alias is made.
 
 on:
   workflow_dispatch:
@@ -84,7 +86,7 @@ jobs:
           sub("#    include <sys/mman.h>\n#    include <unistd.h>\n#else",
               "#    include <sys/mman.h>\n#    include <sys/sysctl.h>\n#    include <unistd.h>\n#else")
 
-          # 2. Helpers: is a JIT server attached, and a local fallback mapping.
+          # 2. Helper: is a JIT server (tracer) attached?
           sub("__attribute__((noinline, optnone, naked)) static void* prepare_jit_region(void*, std::size_t)",
               """// Only an attached tracer (StikDebug, a debugger) can service the
           // `brk #0xf00d` requests below. JIT granted by dynamic-codesigning
@@ -100,26 +102,41 @@ jobs:
               return (info.kp_proc.p_flag & P_TRACED) != 0;
           }
 
-          inline void* map_local_jit_region(std::size_t size)
-          {
-              void* memory = mmap(nullptr, size, PROT_READ | PROT_EXEC, MAP_ANON | MAP_PRIVATE | MAP_JIT, -1, 0);
-              if (memory == MAP_FAILED)
-                  memory = mmap(nullptr, size, PROT_READ | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
-              return memory == MAP_FAILED ? nullptr : memory;
-          }
-
           __attribute__((noinline, optnone, naked)) static void* prepare_jit_region(void*, std::size_t)""")
 
-          # 3. Use the trap only when a JIT server is attached.
-          sub("m_memory = (std::uint32_t*)detail::prepare_jit_region(nullptr, size);",
-              "const bool via_jit_server = detail::jit_server_attached();\n"
-              "            m_memory = via_jit_server\n"
-              "                ? (std::uint32_t*)detail::prepare_jit_region(nullptr, size)\n"
-              "                : (std::uint32_t*)detail::map_local_jit_region(size);")
+          # 3. No tracer: one RX mapping, W^X flipped with mprotect (upstream
+          #    touchHLE's approach, known to work with permanent JIT on A11).
+          sub("        if (reusable_region.memory != nullptr) {",
+              "        if (!detail::jit_server_attached()) {\n"
+              "            void* local = mmap(nullptr, size, PROT_READ | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);\n"
+              "            m_memory = local == MAP_FAILED ? nullptr : (std::uint32_t*)local;\n"
+              "            m_wmemory = m_memory;\n"
+              "            m_local_wx = true;\n"
+              "        } else if (reusable_region.memory != nullptr) {")
 
-          # 4. Never send the detach trap if no server handed us the region.
-          sub("m_should_detach_jit_server = true;",
-              "m_should_detach_jit_server = via_jit_server;")
+          # 4. Flip protections for the local mapping.
+          sub("    void protect()\n    {\n",
+              "    void protect()\n    {\n"
+              "#if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR\n"
+              "        if (m_local_wx) {\n"
+              "            mprotect(m_memory, m_size, PROT_READ | PROT_EXEC);\n"
+              "            return;\n"
+              "        }\n"
+              "#endif\n")
+          sub("    void unprotect()\n    {\n",
+              "    void unprotect()\n    {\n"
+              "#if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR\n"
+              "        if (m_local_wx) {\n"
+              "            mprotect(m_memory, m_size, PROT_READ | PROT_WRITE);\n"
+              "            return;\n"
+              "        }\n"
+              "#endif\n")
+
+          # 5. State flag, and don't unmap the same region twice.
+          sub("    bool m_should_detach_jit_server = false;",
+              "    bool m_should_detach_jit_server = false;\n    bool m_local_wx = false;")
+          sub("        munmap(m_wmemory, m_size);",
+              "        if (m_wmemory != m_memory)\n            munmap(m_wmemory, m_size);")
 
           path.write_text(src)
           print("oaknut patched")
